@@ -40,10 +40,12 @@ def ensure_package(import_name, pip_name=None):
 ensure_package("sklearn", "scikit-learn")
 ensure_package("lightgbm")
 ensure_package("openpyxl")
+ensure_package("networkx")
 
 # %%
 import lightgbm as lgb
 import matplotlib.pyplot as plt
+import networkx as nx
 import numpy as np
 import pandas as pd
 import requests
@@ -74,14 +76,14 @@ Path("figures_production").mkdir(exist_ok=True)
 #
 # Recommended workflows:
 #
-# - Fast rerun: put `crane_features.csv` in the working directory and use `SOURCE_MODE="auto"`.
-# - New Customs collection: set `SOURCE_MODE="customs_api"` and enter a Public Data Portal service key.
+# - Full production run: keep `SOURCE_MODE="customs_api"` and enter a Public Data Portal service key.
+# - Fast rerun: set `SOURCE_MODE="existing_features"` and upload `crane_features.csv`.
 # - Local data: set `SOURCE_MODE="local_trade"` and put paths in `LOCAL_TRADE_PATHS`.
 #
 # External monthly features are optional. Each file should have a date/month column and numeric variables.
 
 # %%
-SOURCE_MODE = "auto"  # auto, existing_features, local_trade, customs_api
+SOURCE_MODE = "customs_api"  # customs_api, existing_features, local_trade, auto
 
 LOCAL_FEATURE_PATHS = [
     "crane_features.csv",
@@ -99,12 +101,19 @@ EXTERNAL_MONTHLY_PATHS = [
     # Example: "macro_monthly.csv"
 ]
 
-# Customs API defaults. HS codes can be 2, 4, 6, or 10 digit. The API often
-# returns lower-level HS rows even when a parent HS code is used.
+# Customs API defaults. HS codes can be 2, 4, 6, or 10 digit. For production,
+# collect all HS chapters 01-99. The API often returns lower-level HS rows even
+# when a parent HS chapter/code is used.
 START_YYYYMM = "202001"
 END_YYYYMM = "202412"
-HS_CODES = ["8542", "8507"]
+HS_SCOPE = "all_chapters"  # all_chapters, selected
+HS_CODES = [f"{i:02d}" for i in range(1, 100)]
 COUNTRY_CODES = [None]  # None means all countries if the API accepts omitted cntyCd.
+CUSTOMS_CACHE_DIR = "data_raw/customs_api_cache"
+OVERWRITE_CUSTOMS_CACHE = False
+CUSTOMS_SLEEP_SEC = 0.25
+CUSTOMS_MAX_RETRIES = 3
+CUSTOMS_MAX_PAGES_PER_JOB = None  # set small int for API debugging only
 
 # BOK ECOS optional augmentation. USD/KRW monthly average is included as a
 # working default from ECOS table 731Y004.
@@ -121,6 +130,15 @@ MATERIAL_QUANTILE = 0.90
 
 # Top-K values used in validation and charts.
 K_VALUES = [10, 30, 50, 100, 200]
+
+# Exploratory HS-to-HS propagation settings. Full HS coverage can contain many
+# HS codes, so the visualization is restricted to the most relevant HS nodes.
+RISK_PROPAGATION_ENABLED = True
+RISK_PROPAGATION_MIN_MONTHS = 6
+RISK_PROPAGATION_MAX_LAG = 3
+RISK_PROPAGATION_CORR_THRESHOLD = 0.45
+RISK_PROPAGATION_MAX_NODES = 40
+RISK_PROPAGATION_NODE_SELECTION = "actual_amount"  # actual_amount, import_value, warning
 
 # %% [markdown]
 # ## 2. Model in plain language
@@ -175,6 +193,25 @@ def first_existing(paths):
         if Path(p).exists():
             return p
     return None
+
+
+def maybe_colab_upload():
+    """Prompt for file upload when running in Colab and no local data file exists."""
+    try:
+        from google.colab import files as colab_files
+    except Exception:
+        return None, None
+
+    print(
+        "No local data file found in this Colab runtime.\n"
+        "Upload one of these files: crane_features.csv, trade_clean.csv, customs_raw.csv, or an Excel/CSV trade table."
+    )
+    uploaded = colab_files.upload()
+    if not uploaded:
+        return None, None
+    first_name = next(iter(uploaded.keys()))
+    print("Uploaded:", first_name)
+    return first_name, read_table_auto(first_name)
 
 
 def clean_numeric(series):
@@ -277,6 +314,19 @@ def make_yearly_periods(start_yyyymm, end_yyyymm):
     return periods
 
 
+def resolve_hs_codes():
+    if HS_SCOPE == "all_chapters":
+        return [f"{i:02d}" for i in range(1, 100)]
+    if HS_SCOPE == "selected":
+        return [str(x).zfill(2) if str(x).isdigit() and len(str(x)) == 1 else str(x) for x in HS_CODES]
+    raise ValueError("HS_SCOPE must be 'all_chapters' or 'selected'.")
+
+
+def safe_cache_name(hs_code, country_code, start_yyyymm, end_yyyymm):
+    country = country_code if country_code not in (None, "") else "ALL"
+    return f"customs_hs_{hs_code}_country_{country}_{start_yyyymm}_{end_yyyymm}.csv"
+
+
 def call_customs_api_xml(
     service_key,
     start_yyyymm,
@@ -316,32 +366,73 @@ def parse_customs_xml(xml_text):
     return pd.DataFrame(rows), total_count
 
 
-def collect_customs_api(service_key, hs_codes, start_yyyymm, end_yyyymm, country_codes=(None,)):
+def collect_customs_api(
+    service_key,
+    hs_codes,
+    start_yyyymm,
+    end_yyyymm,
+    country_codes=(None,),
+    cache_dir=CUSTOMS_CACHE_DIR,
+    overwrite_cache=OVERWRITE_CUSTOMS_CACHE,
+    sleep_sec=CUSTOMS_SLEEP_SEC,
+    max_retries=CUSTOMS_MAX_RETRIES,
+    max_pages_per_job=CUSTOMS_MAX_PAGES_PER_JOB,
+):
     periods = make_yearly_periods(start_yyyymm, end_yyyymm)
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
     frames = []
     failures = []
     for hs in hs_codes:
         for country in country_codes:
             for start, end in periods:
-                page = 1
-                while True:
+                cache_path = cache_dir / safe_cache_name(hs, country, start, end)
+                if cache_path.exists() and not overwrite_cache:
                     try:
-                        xml_text = call_customs_api_xml(
-                            service_key, start, end, hs, country, page_no=page
-                        )
-                        df_page, total_count = parse_customs_xml(xml_text)
+                        cached = read_table_auto(cache_path)
+                        frames.append(cached)
+                        print(f"Cache hit: hs={hs}, country={country or 'ALL'}, {start}-{end}, rows={len(cached)}")
+                        continue
+                    except Exception as err:
+                        print("Cache read failed, refetching:", cache_path, err)
+
+                page = 1
+                job_pages = []
+                while True:
+                    last_error = None
+                    try:
+                        for attempt in range(1, max_retries + 1):
+                            try:
+                                xml_text = call_customs_api_xml(
+                                    service_key, start, end, hs, country, page_no=page
+                                )
+                                df_page, total_count = parse_customs_xml(xml_text)
+                                break
+                            except Exception as err:
+                                last_error = err
+                                wait = sleep_sec * attempt
+                                print(f"Retry {attempt}/{max_retries}: hs={hs}, {start}-{end}, page={page}, error={err}")
+                                time.sleep(wait)
+                        else:
+                            raise RuntimeError(last_error)
+
                         if df_page.empty:
                             break
                         df_page["query_hs_code"] = hs
                         df_page["query_country_code"] = country if country else ""
                         df_page["query_start_yyyymm"] = start
                         df_page["query_end_yyyymm"] = end
-                        frames.append(df_page)
-                        print(f"Customs hs={hs}, country={country or 'ALL'}, {start}-{end}, page={page}, rows={len(df_page)}")
+                        df_page["query_page_no"] = page
+                        job_pages.append(df_page)
+                        print(f"Customs hs={hs}, country={country or 'ALL'}, {start}-{end}, page={page}, rows={len(df_page)}, total={total_count}")
+
+                        if max_pages_per_job is not None and page >= max_pages_per_job:
+                            print("Stopped by CUSTOMS_MAX_PAGES_PER_JOB for debugging.")
+                            break
                         if total_count is None or page * 10000 >= total_count:
                             break
                         page += 1
-                        time.sleep(0.25)
+                        time.sleep(sleep_sec)
                     except Exception as err:
                         failures.append(
                             {
@@ -355,6 +446,10 @@ def collect_customs_api(service_key, hs_codes, start_yyyymm, end_yyyymm, country
                         )
                         print("Customs failure:", failures[-1])
                         break
+                if job_pages:
+                    job_df = pd.concat(job_pages, ignore_index=True)
+                    job_df.to_csv(cache_path, index=False, encoding="utf-8-sig")
+                    frames.append(job_df)
     raw = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     failed = pd.DataFrame(failures)
     raw.to_csv("data_raw/customs_raw_production.csv", index=False, encoding="utf-8-sig")
@@ -429,6 +524,10 @@ source_log = []
 
 feature_path = first_existing(LOCAL_FEATURE_PATHS)
 trade_path = first_existing(LOCAL_TRADE_PATHS)
+uploaded_name, uploaded_df = (None, None)
+
+if SOURCE_MODE == "auto" and feature_path is None and trade_path is None:
+    uploaded_name, uploaded_df = maybe_colab_upload()
 
 if SOURCE_MODE in ["auto", "existing_features"] and feature_path:
     crane_or_trade = read_table_auto(feature_path)
@@ -440,7 +539,20 @@ elif SOURCE_MODE in ["auto", "local_trade"] and trade_path:
     raw_local = read_table_auto(trade_path)
     crane_or_trade = standardize_trade_dataframe(raw_local)
     source_log.append(f"Loaded local trade file: {trade_path}")
+elif SOURCE_MODE == "auto" and uploaded_df is not None:
+    crane_or_trade = uploaded_df.copy()
+    if "date" in crane_or_trade.columns:
+        crane_or_trade["date"] = pd.to_datetime(crane_or_trade["date"], errors="coerce")
+    if "next_date" in crane_or_trade.columns:
+        crane_or_trade["next_date"] = pd.to_datetime(crane_or_trade["next_date"], errors="coerce")
+    source_log.append(f"Loaded uploaded file from Colab runtime: {uploaded_name}")
 elif SOURCE_MODE == "customs_api":
+    active_hs_codes = resolve_hs_codes()
+    print(
+        f"Customs API production collection: HS_SCOPE={HS_SCOPE}, "
+        f"HS jobs={len(active_hs_codes)}, period={START_YYYYMM}-{END_YYYYMM}. "
+        "This can take a long time for all chapters; cached jobs are reused."
+    )
     raw_key = getpass("Public Data Portal service key: ").strip()
     raw = pd.DataFrame()
     last_error = None
@@ -448,7 +560,7 @@ elif SOURCE_MODE == "customs_api":
         try:
             raw, failed = collect_customs_api(
                 key,
-                hs_codes=HS_CODES,
+                hs_codes=active_hs_codes,
                 start_yyyymm=START_YYYYMM,
                 end_yyyymm=END_YYYYMM,
                 country_codes=COUNTRY_CODES,
@@ -463,11 +575,58 @@ elif SOURCE_MODE == "customs_api":
     crane_or_trade = standardize_trade_dataframe(raw)
     source_log.append("Collected trade data from Customs API")
 else:
-    raise FileNotFoundError("No usable data source found. Provide crane_features.csv, trade CSV, or use customs_api.")
+    cwd_files = [p.name for p in Path(".").glob("*") if p.is_file()]
+    raise FileNotFoundError(
+        "No usable data source found. In Colab, upload crane_features.csv when prompted, "
+        "or set SOURCE_MODE='customs_api'. Current runtime files: "
+        + ", ".join(cwd_files[:30])
+    )
 
 print("\n".join(source_log))
 print("loaded shape:", crane_or_trade.shape)
 display(crane_or_trade.head())
+
+
+def diagnose_hs_scope(df, label):
+    if "hs_code" not in df.columns:
+        return
+    hs = df["hs_code"].astype(str).str.replace(r"\.0$", "", regex=True).str.zfill(2)
+    chapters = hs.str[:2]
+    summary = pd.DataFrame(
+        {
+            "metric": [
+                "rows",
+                "unique_hs_codes",
+                "unique_hs_chapters",
+                "min_chapter",
+                "max_chapter",
+            ],
+            "value": [
+                len(df),
+                hs.nunique(),
+                chapters.nunique(),
+                chapters.min(),
+                chapters.max(),
+            ],
+        }
+    )
+    print(f"HS scope diagnostic: {label}")
+    display(summary)
+    display(
+        chapters.value_counts()
+        .sort_index()
+        .rename_axis("hs_chapter")
+        .reset_index(name="rows")
+        .head(120)
+    )
+    if chapters.nunique() <= 3 or chapters.isin(["85"]).mean() > 0.80:
+        print(
+            "WARNING: This data is narrow in HS coverage. "
+            "For full production, use SOURCE_MODE='customs_api' and HS_SCOPE='all_chapters'."
+        )
+
+
+diagnose_hs_scope(crane_or_trade, "loaded input")
 
 # %% [markdown]
 # ## 5. Optional external monthly features
@@ -682,6 +841,7 @@ if not monthly_features.empty:
 crane.to_csv("output_production/crane_features_production.csv", index=False, encoding="utf-8-sig")
 print("crane shape:", crane.shape)
 display(crane.head())
+diagnose_hs_scope(crane, "CRANE feature frame")
 
 # %% [markdown]
 # ## 7. Data checks and visual coverage
@@ -1450,7 +1610,309 @@ for path in sorted(Path("figures_production").glob("*.png")):
     print("-", path)
 
 # %% [markdown]
-# ## 16. Interpretation template
+# ## 16. Exploratory HS-to-HS Risk Propagation Network
+#
+# 이 섹션은 최종 경보점수를 HS 단위 월별 위험 시계열로 압축한 뒤, 한 HS의 위험 상승이 다른 HS의 위험 상승보다 1-3개월 선행하는지를 탐색합니다.
+#
+# 중요한 점:
+#
+# - 이 분석은 인과관계 증명이 아니라 **전파 후보 탐색**입니다.
+# - 전체 HS 데이터에서는 HS 코드가 많아 pairwise 계산이 커지므로, 실제 충격금액/수입금액/경보점수 기준 상위 HS만 시각화합니다.
+# - 결과는 후속 분석에서 공급망 연결, 산업분류, 품목군 지식과 결합해 해석해야 합니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED:
+    propagation_df = test_scored.copy()
+    propagation_df["date"] = pd.to_datetime(propagation_df["date"])
+    propagation_df["month_id"] = propagation_df["date"].dt.to_period("M").astype(str)
+    propagation_df["hs_code"] = propagation_df["hs_code"].astype(str)
+
+    hs_month = (
+        propagation_df.groupby(["hs_code", "date"], as_index=False)
+        .agg(
+            hs_warning_mean=("hybrid_warning_score", "mean"),
+            hs_prob_mean=("material_shock_probability", "mean"),
+            hs_structural_mean=("structural_risk_score", "mean"),
+            hs_material_rate=("material_anomaly", "mean"),
+            hs_actual_amount=(target_col, "sum"),
+            hs_import_value=("import_value", "sum"),
+            n_country=("country_code", "nunique"),
+        )
+    )
+
+    hs_counts = hs_month.groupby("hs_code")["date"].nunique()
+    valid_hs = hs_counts[hs_counts >= RISK_PROPAGATION_MIN_MONTHS].index
+    hs_month = hs_month[hs_month["hs_code"].isin(valid_hs)].copy()
+
+    node_rank = (
+        hs_month.groupby("hs_code", as_index=False)
+        .agg(
+            mean_warning=("hs_warning_mean", "mean"),
+            total_actual_amount=("hs_actual_amount", "sum"),
+            total_import_value=("hs_import_value", "sum"),
+            mean_material_rate=("hs_material_rate", "mean"),
+            n_month=("date", "nunique"),
+        )
+    )
+
+    if RISK_PROPAGATION_NODE_SELECTION == "actual_amount":
+        node_rank = node_rank.sort_values(["total_actual_amount", "mean_warning"], ascending=False)
+    elif RISK_PROPAGATION_NODE_SELECTION == "import_value":
+        node_rank = node_rank.sort_values(["total_import_value", "mean_warning"], ascending=False)
+    elif RISK_PROPAGATION_NODE_SELECTION == "warning":
+        node_rank = node_rank.sort_values(["mean_warning", "total_actual_amount"], ascending=False)
+    else:
+        raise ValueError("RISK_PROPAGATION_NODE_SELECTION must be actual_amount, import_value, or warning.")
+
+    selected_hs = node_rank.head(RISK_PROPAGATION_MAX_NODES)["hs_code"].tolist()
+    hs_month = hs_month[hs_month["hs_code"].isin(selected_hs)].copy()
+
+    print("HS propagation nodes used:", len(selected_hs))
+    display(node_rank.head(RISK_PROPAGATION_MAX_NODES))
+
+# %% [markdown]
+# ### 16.1 HS-Month Risk Matrix
+#
+# 각 HS 코드의 월별 평균 경보점수(`hs_warning_mean`)를 행렬로 만듭니다. 행은 월, 열은 HS 코드입니다. 결측 월은 해당 HS의 평균값으로 채워서 상관계산이 가능하게 합니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED and len(hs_month) > 0:
+    risk_col = "hs_warning_mean"
+    risk_mat = (
+        hs_month.pivot_table(index="date", columns="hs_code", values=risk_col, aggfunc="mean")
+        .sort_index()
+    )
+    risk_mat = risk_mat.apply(lambda x: x.fillna(x.mean()), axis=0)
+    risk_mat = risk_mat.dropna(axis=1, how="all")
+    print("risk_mat shape:", risk_mat.shape)
+    display(risk_mat.head())
+
+    plt.figure(figsize=(min(18, 0.35 * risk_mat.shape[1] + 5), 6))
+    sns.heatmap(risk_mat.T, cmap="YlGnBu", cbar_kws={"label": "HS warning score"})
+    plt.title("HS-month warning score matrix")
+    plt.xlabel("Month")
+    plt.ylabel("HS code")
+    save_fig("figures_production/10_hs_month_warning_matrix.png")
+
+# %% [markdown]
+# ### 16.2 Lagged Correlation Edges
+#
+# `from_hs`의 위험점수가 `lag`개월 전에 높았을 때 `to_hs`의 현재 위험점수와 얼마나 같이 움직이는지 계산합니다. 양의 상관이 높으면 “전파 후보 edge”로 봅니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED and "risk_mat" in globals() and risk_mat.shape[1] >= 2:
+    edges = []
+    hs_list = list(risk_mat.columns)
+
+    for lag in range(1, RISK_PROPAGATION_MAX_LAG + 1):
+        lead = risk_mat.shift(lag)
+        current = risk_mat
+        for h_from in hs_list:
+            x = lead[h_from]
+            for h_to in hs_list:
+                if h_from == h_to:
+                    continue
+                y = current[h_to]
+                tmp = pd.concat([x, y], axis=1).dropna()
+                if len(tmp) < max(5, RISK_PROPAGATION_MIN_MONTHS - lag):
+                    continue
+                corr = tmp.iloc[:, 0].corr(tmp.iloc[:, 1])
+                if np.isfinite(corr):
+                    edges.append(
+                        {
+                            "from_hs": h_from,
+                            "to_hs": h_to,
+                            "lag": lag,
+                            "lagged_corr": corr,
+                            "abs_corr": abs(corr),
+                        }
+                    )
+
+    edge_df = pd.DataFrame(edges)
+    if edge_df.empty:
+        strong_edges = pd.DataFrame(columns=["from_hs", "to_hs", "lag", "lagged_corr", "abs_corr"])
+        print("No lagged HS edges could be computed.")
+    else:
+        strong_edges = edge_df[edge_df["lagged_corr"] >= RISK_PROPAGATION_CORR_THRESHOLD].copy()
+        display(edge_df.sort_values("lagged_corr", ascending=False).head(30))
+        print("Strong positive lagged links:", len(strong_edges))
+        display(strong_edges.sort_values("lagged_corr", ascending=False).head(30))
+
+# %% [markdown]
+# ### 16.3 Sender and Receiver Summary
+#
+# `out_degree`가 높은 HS는 다른 HS 위험을 선행하는 후보, `in_degree`가 높은 HS는 다른 HS 위험을 뒤따르는 후보로 해석합니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED and "strong_edges" in globals():
+    if strong_edges.empty:
+        sender_receiver = pd.DataFrame(
+            columns=["hs_code", "out_degree", "in_degree", "mean_out_corr", "mean_in_corr"]
+        )
+        print("No strong edges above threshold. Try lowering RISK_PROPAGATION_CORR_THRESHOLD.")
+    else:
+        sender = (
+            strong_edges.groupby("from_hs")
+            .agg(out_degree=("to_hs", "count"), mean_out_corr=("lagged_corr", "mean"))
+            .rename_axis("hs_code")
+            .reset_index()
+        )
+        receiver = (
+            strong_edges.groupby("to_hs")
+            .agg(in_degree=("from_hs", "count"), mean_in_corr=("lagged_corr", "mean"))
+            .rename_axis("hs_code")
+            .reset_index()
+        )
+        sender_receiver = (
+            pd.merge(sender, receiver, on="hs_code", how="outer")
+            .fillna({"out_degree": 0, "in_degree": 0, "mean_out_corr": 0, "mean_in_corr": 0})
+            .sort_values(["out_degree", "mean_out_corr"], ascending=False)
+            .reset_index(drop=True)
+        )
+        display(sender_receiver.head(40))
+
+# %% [markdown]
+# ### 16.4 Propagation Network Visualization
+#
+# 강한 lagged correlation edge만 방향그래프로 그립니다. 노드 크기와 색은 평균 경보점수이며, edge 두께는 lagged correlation 크기입니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED and "strong_edges" in globals():
+    hs_node = (
+        hs_month.groupby("hs_code", as_index=False)
+        .agg(
+            mean_warning=(risk_col, "mean"),
+            total_actual_amount=("hs_actual_amount", "sum"),
+            total_import_value=("hs_import_value", "sum"),
+        )
+    )
+    node_info = hs_node.set_index("hs_code").to_dict("index")
+
+    G = nx.DiGraph()
+    for hs in hs_node["hs_code"]:
+        G.add_node(hs)
+    for _, row in strong_edges.iterrows():
+        G.add_edge(row["from_hs"], row["to_hs"], weight=row["lagged_corr"], lag=row["lag"])
+
+    fig, ax = plt.subplots(figsize=(13, 10))
+    if G.number_of_edges() == 0:
+        ax.text(
+            0.5,
+            0.5,
+            "No strong HS-to-HS links above threshold",
+            ha="center",
+            va="center",
+            fontsize=16,
+        )
+        ax.axis("off")
+    else:
+        pos = nx.spring_layout(G, seed=123, k=0.8)
+        node_sizes = [500 + 3000 * node_info.get(node, {}).get("mean_warning", 0) for node in G.nodes()]
+        node_colors = [node_info.get(node, {}).get("mean_warning", 0) for node in G.nodes()]
+        edge_widths = [1.5 + 5 * G[u][v]["weight"] for u, v in G.edges()]
+
+        nodes = nx.draw_networkx_nodes(
+            G,
+            pos,
+            node_size=node_sizes,
+            node_color=node_colors,
+            cmap="viridis",
+            alpha=0.85,
+            ax=ax,
+        )
+        nx.draw_networkx_edges(
+            G,
+            pos,
+            width=edge_widths,
+            alpha=0.45,
+            arrows=True,
+            arrowsize=18,
+            edge_color="gray",
+            ax=ax,
+        )
+        nx.draw_networkx_labels(G, pos, font_size=10, font_weight="bold", ax=ax)
+        fig.colorbar(nodes, ax=ax, label="Mean HS warning score")
+        ax.axis("off")
+
+    ax.set_title(
+        "Exploratory HS risk propagation network\n"
+        f"Edges: lagged correlation >= {RISK_PROPAGATION_CORR_THRESHOLD}, "
+        f"lag 1-{RISK_PROPAGATION_MAX_LAG} months"
+    )
+    plt.tight_layout()
+    plt.savefig("figures_production/11_hs_risk_propagation_network.png", dpi=180, bbox_inches="tight")
+    plt.show()
+
+# %% [markdown]
+# ### 16.5 Lag Summary and Strongest Relation Heatmap
+#
+# lag별 강한 연결 수를 보고, 각 HS pair에서 가장 높은 lagged correlation을 heatmap으로 확인합니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED and "edge_df" in globals() and not edge_df.empty:
+    lag_summary = (
+        edge_df.query("lagged_corr > 0")
+        .groupby("lag", as_index=False)
+        .agg(
+            mean_positive_corr=("lagged_corr", "mean"),
+            max_corr=("lagged_corr", "max"),
+            n_edges_above_threshold=("lagged_corr", lambda x: (x >= RISK_PROPAGATION_CORR_THRESHOLD).sum()),
+        )
+    )
+    display(lag_summary)
+
+    plt.figure(figsize=(10, 5))
+    sns.barplot(data=lag_summary, x="lag", y="n_edges_above_threshold", color="#2A9D8F")
+    plt.title("Number of strong HS-to-HS risk links by lag")
+    plt.xlabel("Lag in months")
+    plt.ylabel("Number of strong links")
+    save_fig("figures_production/12_hs_links_by_lag.png")
+
+    best_edges = (
+        edge_df.sort_values("lagged_corr", ascending=False)
+        .groupby(["from_hs", "to_hs"], as_index=False)
+        .first()
+    )
+    heat = best_edges.pivot_table(index="from_hs", columns="to_hs", values="lagged_corr", aggfunc="max")
+    plt.figure(figsize=(max(10, 0.35 * heat.shape[1]), max(8, 0.35 * heat.shape[0])))
+    sns.heatmap(
+        heat,
+        cmap="YlGnBu",
+        center=0,
+        linewidths=0.3,
+        linecolor="white",
+        cbar_kws={"label": "Max lagged correlation"},
+    )
+    plt.title("HS-to-HS maximum lagged risk correlation")
+    plt.xlabel("Receiving HS")
+    plt.ylabel("Leading HS")
+    save_fig("figures_production/13_hs_lagged_corr_heatmap.png")
+
+# %% [markdown]
+# ### 16.6 Save Propagation Outputs
+#
+# 전파 네트워크 분석 결과를 CSV로 저장합니다. 이 결과는 발표자료에서 “품목 간 위험 동조/전파 후보”를 보여주는 보조 분석으로 사용할 수 있습니다.
+
+# %%
+if RISK_PROPAGATION_ENABLED:
+    if "edge_df" not in globals():
+        edge_df = pd.DataFrame(columns=["from_hs", "to_hs", "lag", "lagged_corr", "abs_corr"])
+    if "strong_edges" not in globals():
+        strong_edges = pd.DataFrame(columns=["from_hs", "to_hs", "lag", "lagged_corr", "abs_corr"])
+    if "sender_receiver" not in globals():
+        sender_receiver = pd.DataFrame(columns=["hs_code", "out_degree", "in_degree", "mean_out_corr", "mean_in_corr"])
+
+    edge_df.to_csv("output_production/crane_hs_lagged_risk_edges_all.csv", index=False, encoding="utf-8-sig")
+    strong_edges.to_csv("output_production/crane_hs_lagged_risk_edges_strong.csv", index=False, encoding="utf-8-sig")
+    sender_receiver.to_csv("output_production/crane_hs_sender_receiver_summary.csv", index=False, encoding="utf-8-sig")
+
+    print("Saved HS propagation outputs:")
+    print("- output_production/crane_hs_lagged_risk_edges_all.csv")
+    print("- output_production/crane_hs_lagged_risk_edges_strong.csv")
+    print("- output_production/crane_hs_sender_receiver_summary.csv")
+
+# %% [markdown]
+# ## 17. Interpretation template
 #
 # Use this section after running the notebook.
 #
